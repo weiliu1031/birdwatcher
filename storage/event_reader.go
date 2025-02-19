@@ -7,11 +7,9 @@ import (
 )
 
 // EventReader binlog event reader from Milvus
-type EventReader struct {
-}
+type EventReader struct{}
 
 func (reader *EventReader) readHeader(in io.Reader) (*eventHeader, error) {
-
 	header, err := readEventHeader(in)
 	if err != nil {
 		return nil, err
@@ -35,6 +33,14 @@ func readInsertEventData(buffer io.Reader) (insertEventData, error) {
 		return data, err
 	}
 
+	return data, nil
+}
+
+func readIndexFileEventData(buffer io.Reader) (indexFileEventData, error) {
+	data := indexFileEventData{}
+	if err := binary.Read(buffer, commonEndian, &data); err != nil {
+		return data, err
+	}
 	return data, nil
 }
 

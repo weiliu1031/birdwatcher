@@ -9,15 +9,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/congqixia/birdwatcher/models"
 	"github.com/spf13/cobra"
-	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/states/kv"
 )
 
 // getEtcdKillCmd returns command for kill component session
 // usage: kill component
-func getEtcdKillCmd(cli *clientv3.Client, basePath string) *cobra.Command {
-
+func getEtcdKillCmd(cli kv.MetaKV, basePath string) *cobra.Command {
 	component := compAll
 	cmd := &cobra.Command{
 		Use:   "kill",
@@ -45,22 +45,17 @@ func getEtcdKillCmd(cli *clientv3.Client, basePath string) *cobra.Command {
 	return cmd
 }
 
-func etcdKillComponent(cli *clientv3.Client, key string, id int64) error {
+func etcdKillComponent(cli kv.MetaKV, key string, id int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel()
-	resp, err := cli.Get(ctx, key)
-
+	val, err := cli.Load(ctx, key)
 	if err != nil {
 		return err
 	}
 
-	if len(resp.Kvs) != 1 {
-		return errors.New("cannot find session")
-	}
-
 	session := &models.Session{}
 
-	err = json.Unmarshal(resp.Kvs[0].Value, session)
+	err = json.Unmarshal([]byte(val), session)
 	if err != nil {
 		return fmt.Errorf("faild to parse session for key %s, error: %w", key, err)
 	}
@@ -71,6 +66,5 @@ func etcdKillComponent(cli *clientv3.Client, key string, id int64) error {
 
 	// remove session
 
-	_, err = cli.Delete(context.Background(), key)
-	return err
+	return cli.Remove(context.Background(), key)
 }

@@ -1,63 +1,57 @@
 package states
 
 import (
-	"context"
 	"fmt"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/congqixia/birdwatcher/proto/v2.0/commonpb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/milvuspb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/rootcoordpb"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/rootcoordpb"
+	rootcoordpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/rootcoordpb"
 )
 
 type rootCoordState struct {
-	cmdState
+	*framework.CmdState
+	session   *models.Session
 	client    rootcoordpb.RootCoordClient
+	clientv2  rootcoordpbv2.RootCoordClient
 	conn      *grpc.ClientConn
-	prevState State
+	prevState framework.State
 }
 
-func getRootCoordState(client rootcoordpb.RootCoordClient, conn *grpc.ClientConn, prev State, session *models.Session) State {
+// SetupCommands setups the command.
+// also called after each command run to reset flag values.
+func (s *rootCoordState) SetupCommands() {
 	cmd := &cobra.Command{}
-
-	state := &rootCoordState{
-		cmdState: cmdState{
-			label:   fmt.Sprintf("RootCoord-%d(%s)", session.ServerID, session.Address),
-			rootCmd: cmd,
-		},
-		client: client,
-		conn:   conn,
-	}
-
 	cmd.AddCommand(
-		//GetMetrics
-		getRootCoordMetrics(client),
-		//back
-		getBackCmd(state, prev),
+		// metrics
+		getMetricsCmd(s.client),
+		// configuration
+		getConfigurationCmd(s.clientv2, s.session.ServerID),
+		// back
+		getBackCmd(s, s.prevState),
 		// exit
-		getExitCmd(state),
+		getExitCmd(s),
 	)
-	return state
+	s.MergeFunctionCommands(cmd, s)
+
+	s.CmdState.RootCmd = cmd
+	s.SetupFn = s.SetupCommands
 }
 
-func getRootCoordMetrics(client rootcoordpb.RootCoordClient) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "GetMetrics",
-		Short: "show the metrics provided by this rootcoord",
-		Run: func(cmd *cobra.Command, args []string) {
-
-			resp, err := client.GetMetrics(context.Background(), &milvuspb.GetMetricsRequest{
-				Base:    &commonpb.MsgBase{},
-				Request: `{"metric_type": "system_info"}`,
-			})
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			fmt.Printf("Metrics: %#v\n", resp.Response)
-		},
+func getRootCoordState(client rootcoordpb.RootCoordClient, conn *grpc.ClientConn, prev framework.State, session *models.Session) framework.State {
+	state := &rootCoordState{
+		session:   session,
+		CmdState:  framework.NewCmdState(fmt.Sprintf("RootCoord-%d(%s)", session.ServerID, session.Address)),
+		client:    client,
+		clientv2:  rootcoordpbv2.NewRootCoordClient(conn),
+		conn:      conn,
+		prevState: prev,
 	}
-	return cmd
+
+	state.SetupCommands()
+
+	return state
 }

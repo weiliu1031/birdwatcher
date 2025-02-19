@@ -7,86 +7,118 @@ import (
 	"io"
 	"os"
 	"path"
+	"strings"
+	"time"
 
-	"github.com/congqixia/birdwatcher/proto/v2.0/datapb"
+	"github.com/cockroachdb/errors"
 	"github.com/gosuri/uilive"
 	"github.com/manifoldco/promptui"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/spf13/cobra"
-	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/oss"
+	"github.com/milvus-io/birdwatcher/states/etcd/common"
+	etcdversion "github.com/milvus-io/birdwatcher/states/etcd/version"
 )
 
-func getDownloadPKCmd(cli *clientv3.Client, basePath string) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "download-pk",
-		Short: "download pk column of a collection",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			collectionID, err := cmd.Flags().GetInt64("id")
-			if err != nil {
-				return err
-			}
+type DownloadPKParam struct {
+	framework.ParamBase `use:"download-pk" desc:"download segment pk with provided collection/segment id"`
+	MinioAddress        string `name:"minioAddr" default:"" desc:"the minio address to override, leave empty to use milvus.yaml value"`
+	CollectionID        int64  `name:"collection" default:"0" desc:"collection id to download"`
+	SegmentID           int64  `name:"segment" default:"0" desc:"segment id to download"`
+}
 
-			coll, err := getCollectionByID(cli, basePath, collectionID)
-			if err != nil {
-				fmt.Println("Collection not found for id", collectionID)
-				return nil
-			}
-
-			var pkID int64 = -1
-
-			for _, field := range coll.Schema.Fields {
-				if field.IsPrimaryKey {
-					pkID = field.FieldID
-					break
-				}
-			}
-
-			if pkID < 0 {
-				fmt.Println("collection pk not found")
-				return nil
-			}
-
-			segments, err := listSegments(cli, basePath, func(segment *datapb.SegmentInfo) bool {
-				return segment.CollectionID == collectionID
-			})
-
-			if err != nil {
-				return err
-			}
-
-			p := promptui.Prompt{
-				Label: "BucketName",
-			}
-			bucketName, err := p.Run()
-			if err != nil {
-				return err
-			}
-
-			minioClient, err := getMinioClient()
-			if err != nil {
-				fmt.Println("cannot get minio client", err.Error())
-				return nil
-			}
-			exists, err := minioClient.BucketExists(context.Background(), bucketName)
-			if !exists {
-				fmt.Printf("bucket %s not exists\n", bucketName)
-				return nil
-			}
-
-			if !exists {
-				fmt.Printf("Bucket not exist\n")
-				return nil
-			}
-
-			downloadPks(minioClient, bucketName, collectionID, pkID, segments)
-
-			return nil
-		},
+func (s *InstanceState) DownloadPKCommand(ctx context.Context, p *DownloadPKParam) error {
+	collection, err := common.GetCollectionByIDVersion(ctx, s.client, s.basePath, etcdversion.GetVersion(), p.CollectionID)
+	if err != nil {
+		return err
+	}
+	pkField, ok := collection.GetPKField()
+	if !ok {
+		return errors.New("pk field not found")
 	}
 
-	cmd.Flags().Int64("id", 0, "collection id to download")
-	return cmd
+	segments, err := common.ListSegmentsVersion(ctx, s.client, s.basePath, etcdversion.GetVersion(), func(s *models.Segment) bool {
+		return s.CollectionID == p.CollectionID && (p.SegmentID == 0 || p.SegmentID == s.ID)
+	})
+	if err != nil {
+		return err
+	}
+
+	params := []oss.MinioConnectParam{}
+	if p.MinioAddress != "" {
+		params = append(params, oss.WithMinioAddr(p.MinioAddress))
+	}
+
+	minioClient, bucketName, rootPath, err := s.GetMinioClientFromCfg(ctx, params...)
+	if err != nil {
+		return err
+	}
+
+	return s.downloadPKs(ctx, minioClient, bucketName, rootPath, p.CollectionID, pkField.FieldID, segments, s.writeLogfile)
+}
+
+func (s *InstanceState) writeLogfile(ctx context.Context, obj *minio.Object) error {
+	return nil
+}
+
+func (s *InstanceState) downloadPKs(ctx context.Context, cli *minio.Client, bucketName, rootPath string, collID int64, pkID int64, segments []*models.Segment, handler func(context.Context, *minio.Object) error) error {
+	folder := fmt.Sprintf("dlpks_%s", time.Now().Format("20060102150406"))
+	err := os.Mkdir(folder, 0o777)
+	if err != nil {
+		fmt.Println("Failed to create folder,", err.Error())
+	}
+
+	pd := uilive.New()
+	pf := "Downloading pk files ... %d%%(%d/%d)\n"
+	pd.Start()
+	fmt.Fprintf(pd, pf, 0, 0, len(segments))
+	defer pd.Stop()
+
+	count := 0
+	for i, segment := range segments {
+		targetFolder := fmt.Sprintf("%s/%d", folder, segment.ID)
+		os.Mkdir(targetFolder, 0o777)
+		for _, fieldBinlog := range segment.GetBinlogs() {
+			if fieldBinlog.FieldID != pkID {
+				continue
+			}
+
+			for _, binlog := range fieldBinlog.Binlogs {
+				logPath := strings.Replace(binlog.LogPath, "ROOT_PATH", rootPath, -1)
+				obj, err := cli.GetObject(ctx, bucketName, logPath, minio.GetObjectOptions{})
+				if err != nil {
+					fmt.Println("failed to download file", bucketName, logPath)
+					return err
+				}
+
+				name := path.Base(logPath)
+
+				f, err := os.Create(path.Join(targetFolder, name))
+				if err != nil {
+					fmt.Println("failed to open file")
+					return err
+				}
+				w := bufio.NewWriter(f)
+				r := bufio.NewReader(obj)
+				_, err = io.Copy(w, r)
+				if err != nil {
+					fmt.Println(err.Error())
+				}
+				w.Flush()
+				f.Close()
+				count++
+			}
+		}
+		progress := (i + 1) * 100 / len(segments)
+		fmt.Fprintf(pd, pf, progress, i+1, len(segments))
+	}
+
+	fmt.Println()
+	fmt.Printf("pk file download completed for collection :%d, %d file(s) downloaded\n", collID, count)
+	return nil
 }
 
 func getMinioClient() (*minio.Client, error) {
@@ -155,65 +187,9 @@ func getMinioClient() (*minio.Client, error) {
 		Creds:  cred,
 		Secure: useSSL,
 	})
-
 	if err != nil {
 		return nil, err
 	}
 
 	return minioClient, nil
-}
-
-func downloadPks(cli *minio.Client, bucketName string, collID, pkID int64, segments []*datapb.SegmentInfo) {
-	err := os.Mkdir(fmt.Sprintf("%d", collID), 0777)
-	if err != nil {
-		fmt.Println("Failed to create folder,", err.Error())
-	}
-
-	pd := uilive.New()
-	pf := "Downloading pk files ... %d%%(%d/%d)\n"
-	pd.Start()
-	fmt.Fprintf(pd, pf, 0, 0, len(segments))
-	defer pd.Stop()
-
-	count := 0
-	for i, segment := range segments {
-		for _, fieldBinlog := range segment.Binlogs {
-			if fieldBinlog.FieldID != pkID {
-				continue
-			}
-
-			folder := fmt.Sprintf("%d/%d", collID, segment.ID)
-			err := os.MkdirAll(folder, 0777)
-			if err != nil {
-				fmt.Println("Failed to create sub-folder", err.Error())
-				return
-			}
-
-			for _, binlog := range fieldBinlog.Binlogs {
-				obj, err := cli.GetObject(context.Background(), bucketName, binlog.GetLogPath(), minio.GetObjectOptions{})
-				if err != nil {
-					fmt.Println("failed to download file", bucketName, binlog.GetLogPath())
-					return
-				}
-
-				name := path.Base(binlog.GetLogPath())
-
-				f, err := os.Create(path.Join(folder, name))
-				if err != nil {
-					fmt.Println("failed to open file")
-					return
-				}
-				w := bufio.NewWriter(f)
-				r := bufio.NewReader(obj)
-				io.Copy(w, r)
-				count++
-			}
-		}
-		progress := (i + 1) * 100 / len(segments)
-		fmt.Fprintf(pd, pf, progress, i+1, len(segments))
-
-	}
-	fmt.Println()
-	fmt.Printf("pk file download completed for collection :%d, %d file(s) downloaded\n", collID, count)
-
 }

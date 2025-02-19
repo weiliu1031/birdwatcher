@@ -1,31 +1,33 @@
 # Birdwatcher
 
-[![linter status](https://github.com/congqixia/birdwatcher/workflows/golangci-lint/badge.svg)](https://github.com/congqixia/birdwatcher/actions/workflows/golangci-lint.yml?query=branch%3Amain+)
+[![linter status](https://github.com/milvus-io/birdwatcher/workflows/golangci-lint/badge.svg)](https://github.com/milvus-io/birdwatcher/actions/workflows/golangci-lint.yml?query=branch%3Amain+)
 
 Debug tool for Milvus 2.0 project. This tool connects to etcd and inspect some status of the Milvus system.
 
 ## Get Started
 
 ### Prerequisite
-go 1.16 or higher 
+go 1.18 or higher 
 
 ### Install birdwatcher
 
-install with go command
+download source and run with go command
+
 ```shell
-go install github.com/congqixia/birdwatcher
+git clone https://github.com/milvus-io/birdwatcher
+cd birdwatcher
+go install
 ```
 
-or download source and run with go command
-```shell
-git clone https://github.com/congqixia/birdwatcher
-cd birdwatcher
-go build -o birdwatcher main.go
-```
+tips: [As JimB notice in comments](https://stackoverflow.com/questions/69807151/go-install-github-com-dmacvicar-terraform-provider-libvirtlatest-shows-error):
+
+> If there are replace or exclude directives in the module, the correct installation method is to clone the source and install it.
 
 ## How to use
 
 ### connect to etcd 
+
+<img alt="connect to etcd" src="./docs/images/connect.gif" width="600" />
 
 ```shell
 ❯ birdwatcher
@@ -48,6 +50,9 @@ Using meta path: instanceName/meta/
 
 ### inspect some meta
 
+
+<img alt="inspect meta" src="./docs/images/show.gif" width="600" />
+
 ```
 Milvus(by-dev): show collections
 ================================================================================
@@ -68,8 +73,11 @@ Consistency Level: Strong
 
 ### backup etcd
 
+
+<img alt="inspect meta" src="./docs/images/backup.gif" width="600" />
+
 ```
-Milvus(by-dev): backup --component all
+Milvus(by-dev): backup
 found 37 keys, at revision 533816, starting backup...
 Backing up ... 100%(37/37)
 backup etcd for prefix by-dev/meta done, stored in file: bw_etcd_ALL.220707-152246.bak.gz

@@ -1,63 +1,58 @@
 package states
 
 import (
-	"context"
 	"fmt"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/congqixia/birdwatcher/proto/v2.0/commonpb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/datapb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/milvuspb"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/datapb"
+	datapbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/datapb"
 )
 
 type dataNodeState struct {
-	cmdState
+	*framework.CmdState
+	session   *models.Session
 	client    datapb.DataNodeClient
+	clientv2  datapbv2.DataNodeClient
 	conn      *grpc.ClientConn
-	prevState State
+	prevState framework.State
 }
 
-func getDataNodeState(client datapb.DataNodeClient, conn *grpc.ClientConn, prev State, session *models.Session) State {
+// SetupCommands setups the command.
+// also called after each command run to reset flag values.
+func (s *dataNodeState) SetupCommands() {
 	cmd := &cobra.Command{}
-
-	state := &dataNodeState{
-		cmdState: cmdState{
-			label:   fmt.Sprintf("DataNode-%d(%s)", session.ServerID, session.Address),
-			rootCmd: cmd,
-		},
-		client: client,
-		conn:   conn,
-	}
-
 	cmd.AddCommand(
-		//GetMetrics
-		getDataNodeMetrics(client),
-		//back
-		getBackCmd(state, prev),
+		// metrics
+		getMetricsCmd(s.client),
+		// configuration
+		getConfigurationCmd(s.clientv2, s.session.ServerID),
+		// back
+		getBackCmd(s, s.prevState),
 		// exit
-		getExitCmd(state),
+		getExitCmd(s),
 	)
-	return state
+
+	s.MergeFunctionCommands(cmd, s)
+
+	s.CmdState.RootCmd = cmd
+	s.SetupFn = s.SetupCommands
 }
 
-func getDataNodeMetrics(client datapb.DataNodeClient) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "GetMetrics",
-		Short: "show the metrics provided by this datanode",
-		Run: func(cmd *cobra.Command, args []string) {
-
-			resp, err := client.GetMetrics(context.Background(), &milvuspb.GetMetricsRequest{
-				Base:    &commonpb.MsgBase{},
-				Request: `{"metric_type": "system_info"}`,
-			})
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			fmt.Printf("Metrics: %#v\n", resp.Response)
-		},
+func getDataNodeState(client datapb.DataNodeClient, conn *grpc.ClientConn, prev framework.State, session *models.Session) framework.State {
+	state := &dataNodeState{
+		CmdState:  framework.NewCmdState(fmt.Sprintf("DataNode-%d(%s)", session.ServerID, session.Address)),
+		session:   session,
+		client:    client,
+		clientv2:  datapbv2.NewDataNodeClient(conn),
+		conn:      conn,
+		prevState: prev,
 	}
-	return cmd
+
+	state.SetupCommands()
+
+	return state
 }

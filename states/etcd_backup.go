@@ -5,19 +5,31 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
-	"errors"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"path"
 	"strings"
 	"time"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/congqixia/birdwatcher/proto/v2.0/commonpb"
+	"github.com/cockroachdb/errors"
 	"github.com/golang/protobuf/proto"
-	"github.com/gosuri/uilive"
-	"github.com/spf13/cobra"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/datapb"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/indexpb"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/querypb"
+	"github.com/milvus-io/birdwatcher/proto/v2.0/rootcoordpb"
+	datapbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/datapb"
+	indexpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/indexpb"
+	internalpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/internalpb"
+	querypbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/querypb"
+	rootcoordpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/rootcoordpb"
+	"github.com/milvus-io/birdwatcher/states/etcd/common"
+	"github.com/milvus-io/birdwatcher/states/kv"
 )
 
 type milvusComponent string
@@ -54,67 +66,39 @@ func (c *milvusComponent) Type() string {
 	return "MilvusComponent"
 }
 
-// getBackupEtcdCmd returns command for backup etcd
-// usage: backup [component] [options...]
-func getBackupEtcdCmd(cli *clientv3.Client, basePath string) *cobra.Command {
-
-	component := compAll
-	cmd := &cobra.Command{
-		Use:   "backup",
-		Short: "backup etcd key-values",
-		RunE: func(cmd *cobra.Command, args []string) error {
-
-			ignoreRevision, err := cmd.Flags().GetBool("ignoreRevision")
-			if err != nil {
-				return err
-			}
-
-			prefix := ""
-			switch component {
-			case compAll:
-				prefix = ""
-			case compQueryCoord:
-				prefix = `queryCoord-`
-			default:
-				return fmt.Errorf("component %s not support yet", component)
-			}
-
-			now := time.Now()
-			err = backupEtcd(cli, basePath, prefix, component.String(), fmt.Sprintf("bw_etcd_%s.%s.bak.gz", component, now.Format("060102-150405")), ignoreRevision)
-			if err != nil {
-				fmt.Printf("backup etcd failed, error: %v\n", err)
-			}
-			return nil
-		},
-	}
-
-	cmd.Flags().Var(&component, "component", "component to backup")
-	cmd.Flags().Bool("ignoreRevision", false, "backup ignore revision change, ONLY shall works with no nodes online")
-	return cmd
+type BackupParam struct {
+	framework.ParamBase `use:"backup" desc:"backup etcd key-values"`
+	// Component string `name:""`
+	component      milvusComponent
+	IgnoreRevision bool  `name:"ignoreRevision" default:"false" desc:"backup ignore revision change, ONLY shall works with no nodes online"`
+	BatchSize      int64 `name:"batchSize" default:"100" desc:"batch fetch size for etcd backup operation"`
 }
 
-// backupEtcd backup all key-values with prefix provided into local file.
-// implements gzip compression for now.
-func backupEtcd(cli *clientv3.Client, base, prefix string, component string, filePath string, ignoreRevision bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
-	defer cancel()
-	resp, err := cli.Get(ctx, path.Join(base, prefix), clientv3.WithCountOnly(), clientv3.WithPrefix())
-	if err != nil {
-		return err
+func (p *BackupParam) ParseArgs(args []string) error {
+	if len(args) == 0 {
+		p.component.Set("ALL")
+		return nil
 	}
 
-	if ignoreRevision {
-		fmt.Println("WARNING!!! doing backup ignore revision! please make sure no instanc of milvus is online!")
+	return p.component.Set(args[0])
+}
+
+// getBackupEtcdCmd returns command for backup etcd
+// usage: backup [component] [options...]
+func (s *InstanceState) BackupCommand(ctx context.Context, p *BackupParam) error {
+	prefix := ""
+	switch p.component {
+	case compAll:
+		prefix = ""
+	case compQueryCoord:
+		prefix = `queryCoord-`
+	default:
+		return fmt.Errorf("component %s not supported for separate backup, use ALL instead", p.component.String())
 	}
 
-	cnt := resp.Count
-	rev := resp.Header.Revision
-
-	fmt.Printf("found %d keys, at revision %d, starting backup...\n", cnt, rev)
-
-	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := getBackupFile(p.component.String())
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to open backup file")
 	}
 	defer f.Close()
 
@@ -122,67 +106,283 @@ func backupEtcd(cli *clientv3.Client, base, prefix string, component string, fil
 	defer gw.Close()
 	w := bufio.NewWriter(gw)
 
-	var instance, meta string
-	parts := strings.Split(base, "/")
-	if len(parts) > 1 {
-		meta = parts[len(parts)-1]
-		instance = path.Join(parts[:len(parts)-1]...)
-	} else {
-		instance = base
+	// write backup header
+	// version 2 used for now
+	err = writeBackupHeader(w, 2)
+	if err != nil {
+		return errors.Wrap(err, "failed to write backup file header")
 	}
 
+	err = backupEtcdV2(s.client, s.basePath, prefix, w, p)
+	if err != nil {
+		fmt.Printf("backup etcd failed, error: %v\n", err)
+	}
+	backupMetrics(s.client, s.basePath, w)
+	backupConfiguration(s.client, s.basePath, w)
+	backupAppMetrics(s.client, s.basePath, w)
+	fmt.Printf("backup for prefix done, stored in file: %s\n", f.Name())
+	return nil
+}
+
+func getBackupFile(component string) (*os.File, error) {
+	now := time.Now()
+	filePath := fmt.Sprintf("bw_etcd_%s.%s.bak.gz", component, now.Format("060102-150405"))
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func writeBackupHeader(w io.Writer, version int32) error {
 	lb := make([]byte, 8)
-	header := &models.BackupHeader{Version: 1, Instance: instance, MetaPath: meta, Entries: cnt}
+	header := &models.BackupHeader{Version: version}
 	bs, err := proto.Marshal(header)
 	if err != nil {
 		fmt.Println("failed to marshal backup header,", err.Error())
 		return err
 	}
 	binary.LittleEndian.PutUint64(lb, uint64(len(bs)))
-	fmt.Println("header length:", len(bs))
 	w.Write(lb)
 	w.Write(bs)
+	return nil
+}
 
-	progressDisplay := uilive.New()
-	progressFmt := "Backing up ... %d%%(%d/%d)\n"
-	progressDisplay.Start()
-	fmt.Fprintf(progressDisplay, progressFmt, 0, 0, cnt)
+func backupEtcdV2(cli kv.MetaKV, base, prefix string, w *bufio.Writer, opt *BackupParam) error {
+	return cli.BackupKV(base, prefix, w, opt.IgnoreRevision, opt.BatchSize)
+}
 
-	options := []clientv3.OpOption{clientv3.WithFromKey(), clientv3.WithLimit(1)}
-	if !ignoreRevision {
-		options = append(options, clientv3.WithRev(rev))
+func backupMetrics(cli kv.MetaKV, basePath string, w *bufio.Writer) error {
+	sessions, err := common.ListSessions(context.Background(), cli, basePath)
+	if err != nil {
+		return err
 	}
 
-	currentKey := path.Join(base, prefix)
-	for i := 0; int64(i) < cnt; i++ {
+	ph := models.PartHeader{
+		PartType: int32(models.MetricsBackup),
+		PartLen:  -1, // not sure for length
+	}
+	// write stopper
+	bs, err := proto.Marshal(&ph)
+	if err != nil {
+		fmt.Println("failed to marshal part header for etcd backup", err.Error())
+		return err
+	}
+	writeBackupBytes(w, bs)
+	defer writeBackupBytes(w, nil)
 
-		resp, err = cli.Get(context.Background(), currentKey, options...)
+	for _, session := range sessions {
+		mbs, dmbs, err := fetchInstanceMetrics(session)
 		if err != nil {
-			return err
+			fmt.Printf("failed to fetch metrics for %s(%d), %s\n", session.ServerName, session.ServerID, err.Error())
+			continue
 		}
 
-		for _, kvs := range resp.Kvs {
-
-			entry := &commonpb.KeyDataPair{Key: string(kvs.Key), Data: kvs.Value}
-			bs, err = proto.Marshal(entry)
-			if err != nil {
-				fmt.Println("failed to marshal kv pair", err.Error())
-				return err
-			}
-
-			binary.LittleEndian.PutUint64(lb, uint64(len(bs)))
-			w.Write(lb)
-			w.Write(bs)
-			currentKey = string(append(kvs.Key, 0))
+		bs, err := json.Marshal(session)
+		if err != nil {
+			continue
 		}
-
-		progress := (i + 1) * 100 / int(cnt)
-		fmt.Fprintf(progressDisplay, progressFmt, progress, i+1, cnt)
+		// [session info]
+		// [metrics]
+		// [default metrics]
+		writeBackupBytes(w, bs)
+		writeBackupBytes(w, mbs)
+		writeBackupBytes(w, dmbs)
 	}
-	w.Flush()
-	progressDisplay.Stop()
-
-	fmt.Printf("backup etcd for prefix %s done, stored in file: %s\n", prefix, filePath)
 
 	return nil
+}
+
+func backupAppMetrics(cli kv.MetaKV, basePath string, w *bufio.Writer) error {
+	sessions, err := common.ListSessions(context.Background(), cli, basePath)
+	if err != nil {
+		return err
+	}
+
+	ph := models.PartHeader{
+		PartType: int32(models.AppMetrics),
+		PartLen:  -1, // not sure for length
+	}
+	// write stopper
+	bs, err := proto.Marshal(&ph)
+	if err != nil {
+		fmt.Println("failed to marshal part header for etcd backup", err.Error())
+		return err
+	}
+	writeBackupBytes(w, bs)
+	defer writeBackupBytes(w, nil)
+
+	for _, session := range sessions {
+		opts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		}
+
+		var conn *grpc.ClientConn
+		var err error
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			conn, err = grpc.DialContext(ctx, session.Address, opts...)
+		}()
+		if err != nil {
+			fmt.Printf("failed to connect %s(%d), err: %s\n", session.ServerName, session.ServerID, err.Error())
+			continue
+		}
+
+		var client metricsSource
+		switch strings.ToLower(session.ServerName) {
+		case "rootcoord":
+			client = rootcoordpb.NewRootCoordClient(conn)
+		case "datacoord":
+			client = datapb.NewDataCoordClient(conn)
+		case "indexcoord":
+			client = indexpb.NewIndexCoordClient(conn)
+		case "querycoord":
+			client = querypb.NewQueryCoordClient(conn)
+		case "datanode":
+			client = datapb.NewDataNodeClient(conn)
+		case "querynode":
+			client = querypb.NewQueryNodeClient(conn)
+		case "indexnode":
+			client = indexpb.NewIndexNodeClient(conn)
+		}
+		if client == nil {
+			continue
+		}
+		data, err := getMetrics(context.Background(), client)
+		if err != nil {
+			continue
+		}
+
+		labelBs, err := json.Marshal(session)
+		if err != nil {
+			continue
+		}
+
+		writeBackupBytes(w, labelBs)
+		writeBackupBytes(w, []byte(data))
+	}
+
+	return nil
+}
+
+func backupConfiguration(cli kv.MetaKV, basePath string, w *bufio.Writer) error {
+	sessions, err := common.ListSessions(context.Background(), cli, basePath)
+	if err != nil {
+		return err
+	}
+
+	ph := models.PartHeader{
+		PartType: int32(models.Configurations),
+		PartLen:  -1, // not sure for length
+	}
+	// write stopper
+	bs, err := proto.Marshal(&ph)
+	if err != nil {
+		fmt.Println("failed to marshal part header for etcd backup", err.Error())
+		return err
+	}
+	writeBackupBytes(w, bs)
+	defer writeBackupBytes(w, nil)
+
+	for _, session := range sessions {
+		opts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+			grpc.WithTimeout(2 * time.Second),
+		}
+
+		conn, err := grpc.DialContext(context.Background(), session.Address, opts...)
+		if err != nil {
+			fmt.Printf("failed to connect %s(%d), err: %s\n", session.ServerName, session.ServerID, err.Error())
+			continue
+		}
+
+		var client configurationSource
+		switch strings.ToLower(session.ServerName) {
+		case "rootcoord":
+			client = rootcoordpbv2.NewRootCoordClient(conn)
+		case "datacoord":
+			client = datapbv2.NewDataCoordClient(conn)
+		case "indexcoord":
+			client = indexpbv2.NewIndexCoordClient(conn)
+		case "querycoord":
+			client = querypbv2.NewQueryCoordClient(conn)
+		case "datanode":
+			client = datapbv2.NewDataNodeClient(conn)
+		case "querynode":
+			client = querypbv2.NewQueryNodeClient(conn)
+		case "indexnode":
+			client = indexpbv2.NewIndexNodeClient(conn)
+		}
+		if client == nil {
+			continue
+		}
+		configurations, err := getConfiguration(context.Background(), client, session.ServerID)
+		if err != nil {
+			continue
+		}
+
+		labelBs, err := json.Marshal(session)
+		if err != nil {
+			continue
+		}
+
+		// wrap with response
+		model := &internalpbv2.ShowConfigurationsResponse{
+			Configuations: configurations,
+		}
+		bs, err := proto.Marshal(model)
+		if err != nil {
+			continue
+		}
+
+		writeBackupBytes(w, labelBs)
+		writeBackupBytes(w, bs)
+	}
+
+	return nil
+}
+
+func writeBackupBytes(w *bufio.Writer, data []byte) {
+	lb := make([]byte, 8)
+	binary.LittleEndian.PutUint64(lb, uint64(len(data)))
+	w.Write(lb)
+	if len(data) > 0 {
+		w.Write(data)
+	}
+}
+
+func readBackupBytes(rd io.Reader) ([]byte, uint64, error) {
+	lb := make([]byte, 8)
+	var nextBytes uint64
+	bsRead, err := io.ReadFull(rd, lb) // rd.Read(lb)
+	// all file read
+	if err == io.EOF {
+		return nil, nextBytes, err
+	}
+	if err != nil {
+		fmt.Println("failed to read file:", err.Error())
+		return nil, nextBytes, err
+	}
+	if bsRead < 8 {
+		fmt.Printf("fail to read next length %d instead of 8 read\n", bsRead)
+		return nil, nextBytes, errors.New("invalid file format")
+	}
+
+	nextBytes = binary.LittleEndian.Uint64(lb)
+
+	data := make([]byte, nextBytes)
+	// cannot use rd.Read(bs), since proto marshal may generate a stopper
+	bsRead, err = io.ReadFull(rd, data)
+	if err != nil {
+		return nil, nextBytes, err
+	}
+	if uint64(bsRead) != nextBytes {
+		fmt.Printf("bytesRead(%d)is not equal to nextBytes(%d)\n", bsRead, nextBytes)
+		return nil, nextBytes, err
+	}
+	return data, nextBytes, nil
 }

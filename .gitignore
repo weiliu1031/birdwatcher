@@ -1,1 +1,23 @@
 *.bak
+.idea
+bin/
+
+dist/
+bw_workspace/
+
+birdwatcher-build
+.bw_config
+
+# logs
+audit.log
+audit_*.log
+bw_debug.log
+
+# vim
+*.sw[op]
+
+# backup file
+*.bak.gz
+*.tar.gz
+backups/
+

@@ -92,6 +92,42 @@ func TestInspectVectorIndexValidityRequiresFinishedIndex(t *testing.T) {
 	})
 }
 
+func TestNewUninspectableVectorIndexRecord(t *testing.T) {
+	segmentIndex := &indexpb.SegmentIndex{
+		CollectionID: 10,
+		PartitionID:  20,
+		SegmentID:    30,
+		IndexID:      40,
+		BuildID:      50,
+		NumRows:      1000,
+		State:        commonpb.IndexState_Finished,
+	}
+	fieldIndex := &indexpb.IndexInfo{
+		FieldID: 101,
+		IndexParams: []*commonpb.KeyValuePair{
+			{Key: "index_type", Value: "HNSW"},
+		},
+	}
+	record := newUninspectableVectorIndexRecord(
+		segmentIndex,
+		fieldIndex,
+		nil,
+		"field metadata is missing",
+	)
+
+	require.Equal(t, int64(30), record.SegmentID)
+	require.Equal(t, int64(101), record.FieldID)
+	require.Equal(t, "HNSW", record.IndexType)
+	require.Equal(t, "ERROR", record.Status)
+	require.Equal(t, "field metadata is missing", record.InspectionError)
+
+	report := buildSegmentIndexRowsMismatchReport(&VectorIndexValidityReport{
+		Records: []*VectorIndexValidityRecord{record},
+	})
+	require.Empty(t, report.Records)
+	require.Equal(t, int64(1), report.UninspectedSegments)
+}
+
 func TestDecodeMemoryVectorValidity(t *testing.T) {
 	countPayload := make([]byte, 8)
 	binary.LittleEndian.PutUint64(countPayload, 1000)

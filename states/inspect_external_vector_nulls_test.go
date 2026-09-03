@@ -580,6 +580,45 @@ func TestBuildLancePropertyValuesForwardsSupportedProvider(t *testing.T) {
 	}
 }
 
+func TestBuildLancePropertyValuesForwardsAzureBroker(t *testing.T) {
+	values, err := buildLancePropertyValues(
+		externalSourceLocation{
+			Scheme:   "azure",
+			Host:     "core.windows.net",
+			Bucket:   "container",
+			RootPath: "dataset",
+		},
+		externalSourceSpec{
+			CloudProvider:           "azure",
+			Region:                  "westus3",
+			AccessKeyID:             "storage-account",
+			AzureClientID:           "client-id",
+			AzureTenantID:           "tenant-id",
+			AzureCredentialEndpoint: "https://broker.example.com/v1/credentials/assume-role",
+			LoadFrequency:           3600,
+		},
+		1024,
+	)
+	if err != nil {
+		t.Fatalf("buildLancePropertyValues() error = %v", err)
+	}
+	for key, want := range map[string]string{
+		"extfs.birdwatcher.cloud_provider":            "azure",
+		"extfs.birdwatcher.address":                   "core.windows.net",
+		"extfs.birdwatcher.bucket_name":               "container",
+		"extfs.birdwatcher.access_key_id":             "storage-account",
+		"extfs.birdwatcher.azure_client_id":           "client-id",
+		"extfs.birdwatcher.azure_tenant_id":           "tenant-id",
+		"extfs.birdwatcher.azure_credential_endpoint": "https://broker.example.com/v1/credentials/assume-role",
+		"extfs.birdwatcher.load_frequency":            "3600",
+		"extfs.birdwatcher.use_iam":                   "false",
+	} {
+		if got := values[key]; got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
 func TestRedactExternalVectorSource(t *testing.T) {
 	if got := redactExternalVectorSource("s3://bucket/dataset"); got != "s3://bucket/dataset" {
 		t.Fatalf("redactExternalVectorSource() = %q", got)

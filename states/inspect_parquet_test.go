@@ -498,6 +498,57 @@ func TestBuildExternalMinioClientParam(t *testing.T) {
 	}
 }
 
+func TestBuildExternalMinioClientParamAzureBroker(t *testing.T) {
+	spec, err := parseExternalSpec(`{
+		"format":"parquet",
+		"extfs":{
+			"cloud_provider":"azure",
+			"region":"westus3",
+			"access_key_id":"storage-account",
+			"azure_client_id":"client-ID",
+			"azure_tenant_id":"tenant-ID",
+			"azure_credential_endpoint":"https://broker.example.com/v1/Credentials",
+			"load_frequency":"3600"
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("parseExternalSpec() error = %v", err)
+	}
+	if spec.AzureClientID != "client-ID" || spec.AzureTenantID != "tenant-ID" ||
+		spec.AzureCredentialEndpoint != "https://broker.example.com/v1/Credentials" {
+		t.Fatalf("Azure broker spec = %#v", spec)
+	}
+
+	param, location, err := buildExternalMinioClientParam(
+		"azure://core.windows.net/container/root/path",
+		spec,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("buildExternalMinioClientParam() error = %v", err)
+	}
+	if param.CloudProvider != "azure" || param.Addr != "core.windows.net" ||
+		param.BucketName != "container" || param.RootPath != "root/path" ||
+		param.AK != "storage-account" || param.AzureClientID != "client-ID" ||
+		param.AzureTenantID != "tenant-ID" ||
+		param.AzureCredentialEndpoint != "https://broker.example.com/v1/Credentials" ||
+		!param.DisableAzureConnectionString {
+		t.Fatalf("Azure client parameters = %#v, location = %#v", param, location)
+	}
+	store, _, _, _, err := newExternalObjectStore(
+		t.Context(),
+		"azure://core.windows.net/container/root/path",
+		spec,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("newExternalObjectStore() error = %v", err)
+	}
+	if store == nil {
+		t.Fatal("newExternalObjectStore() returned nil store")
+	}
+}
+
 func TestBuildExternalMinioClientParam_LegacyFallback(t *testing.T) {
 	spec, err := parseExternalSpec("")
 	if err != nil {

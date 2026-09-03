@@ -47,6 +47,18 @@ func ensureLanceVectorScannerAvailable() error {
 	return nil
 }
 
+type lanceSchemaCandidateError struct {
+	err error
+}
+
+func (e *lanceSchemaCandidateError) Error() string {
+	return e.err.Error()
+}
+
+func (e *lanceSchemaCandidateError) Unwrap() error {
+	return e.err
+}
+
 func scanLanceVectorNullRanges(
 	ctx context.Context,
 	ranges []externalVectorSegmentRange,
@@ -126,7 +138,7 @@ func inspectLanceVectorNullObject(
 			return result
 		}
 		lastErr = err
-		if !isLanceSchemaMismatch(err) {
+		if !shouldTryNextLanceVectorType(err) {
 			break
 		}
 	}
@@ -166,12 +178,19 @@ func inspectLanceVectorNullObjectWithType(
 		item.ArrowType = dataType.String()
 	}
 
+	candidateValidated := false
 	for _, interval := range intervals {
 		err := func() error {
 			stream, closeStream, err := openLanceVectorStream(
 				job.ObjectKey, interval.StartIndex, interval.EndIndex,
 				externalField, schema, batchSize, location, spec)
 			if err != nil {
+				if candidateValidated {
+					var candidateError *lanceSchemaCandidateError
+					if errors.As(err, &candidateError) {
+						return candidateError.err
+					}
+				}
 				return err
 			}
 			defer closeStream()
@@ -198,8 +217,13 @@ func inspectLanceVectorNullObjectWithType(
 				record, err := cdata.ImportCRecordBatchWithSchema(&cArray, schema)
 				if err != nil {
 					cdata.ReleaseCArrowArray(&cArray)
-					return errors.Wrap(err, "import Lance record batch")
+					importErr := errors.Wrap(err, "import Lance record batch")
+					if !candidateValidated {
+						return markLanceSchemaCandidateError(importErr)
+					}
+					return importErr
 				}
+				candidateValidated = true
 				if record.NumCols() != 1 {
 					record.Release()
 					return errors.Newf(
@@ -303,7 +327,7 @@ func openLanceVectorStream(
 		&reader,
 	)
 	if err := consumeLanceFFIResult(&ffiResult); err != nil {
-		return nil, nil, errors.Wrap(err, "open Lance reader")
+		return nil, nil, markLanceSchemaCandidateError(errors.Wrap(err, "open Lance reader"))
 	}
 	closeReader := true
 	defer func() {
@@ -431,14 +455,19 @@ func lanceVectorCandidateTypes(fieldType schemapb.DataType, dim int64) []arrow.D
 	return candidates
 }
 
-func isLanceSchemaMismatch(err error) bool {
+func markLanceSchemaCandidateError(err error) error {
 	message := strings.ToLower(err.Error())
 	for _, marker := range []string{"schema", "type", "field", "cast", "column"} {
 		if strings.Contains(message, marker) {
-			return true
+			return &lanceSchemaCandidateError{err: err}
 		}
 	}
-	return false
+	return err
+}
+
+func shouldTryNextLanceVectorType(err error) bool {
+	var candidateError *lanceSchemaCandidateError
+	return errors.As(err, &candidateError)
 }
 
 func newExternalVectorNullResults(ranges []externalVectorSegmentRange) []*ExternalVectorNullRange {

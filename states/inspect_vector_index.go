@@ -277,14 +277,47 @@ func (s *InstanceState) InspectVectorIndexCommand(ctx context.Context, p *Inspec
 			indexID:      segmentIndex.GetIndexID(),
 		}]
 		if fieldIndex == nil {
+			report.Records = append(report.Records, newUninspectableVectorIndexRecord(
+				segmentIndex,
+				nil,
+				nil,
+				fmt.Sprintf(
+					"collection index metadata is missing for collection %d index %d",
+					segmentIndex.GetCollectionID(),
+					segmentIndex.GetIndexID(),
+				),
+			))
 			continue
 		}
 		if p.FieldID != 0 && fieldIndex.GetFieldID() != p.FieldID {
 			continue
 		}
 
-		field := findVectorField(metadata.collections[segmentIndex.GetCollectionID()], fieldIndex.GetFieldID())
-		if field == nil || !typeutil.IsVectorType(field.GetDataType()) {
+		collection := metadata.collections[segmentIndex.GetCollectionID()]
+		if collection == nil {
+			report.Records = append(report.Records, newUninspectableVectorIndexRecord(
+				segmentIndex,
+				fieldIndex,
+				nil,
+				fmt.Sprintf("collection metadata is missing for collection %d", segmentIndex.GetCollectionID()),
+			))
+			continue
+		}
+		field := findVectorField(collection, fieldIndex.GetFieldID())
+		if field == nil {
+			report.Records = append(report.Records, newUninspectableVectorIndexRecord(
+				segmentIndex,
+				fieldIndex,
+				nil,
+				fmt.Sprintf(
+					"field metadata is missing for collection %d field %d",
+					segmentIndex.GetCollectionID(),
+					fieldIndex.GetFieldID(),
+				),
+			))
+			continue
+		}
+		if !typeutil.IsVectorType(field.GetDataType()) {
 			continue
 		}
 		if vectorIndexNeedsObjectStore(segmentIndex) && resolvedStore == nil {
@@ -401,19 +434,30 @@ func findVectorField(collection *models.Collection, fieldID int64) *schemapb.Fie
 	return nil
 }
 
-func inspectVectorIndexValidity(ctx context.Context, resolvedStore *oss.ResolvedObjectStore, segmentIndex *indexpb.SegmentIndex, fieldIndex *indexpb.IndexInfo, field *schemapb.FieldSchema) *VectorIndexValidityRecord {
+func newUninspectableVectorIndexRecord(
+	segmentIndex *indexpb.SegmentIndex,
+	fieldIndex *indexpb.IndexInfo,
+	field *schemapb.FieldSchema,
+	reason string,
+) *VectorIndexValidityRecord {
+	record := newVectorIndexValidityRecord(segmentIndex, fieldIndex, field)
+	record.InspectionError = reason
+	return record
+}
+
+func newVectorIndexValidityRecord(
+	segmentIndex *indexpb.SegmentIndex,
+	fieldIndex *indexpb.IndexInfo,
+	field *schemapb.FieldSchema,
+) *VectorIndexValidityRecord {
 	indexType := segmentIndex.GetIndexType()
-	if indexType == "" {
+	if indexType == "" && fieldIndex != nil {
 		indexType = common.GetKVPair(fieldIndex.GetIndexParams(), "index_type")
 	}
 	record := &VectorIndexValidityRecord{
 		CollectionID: segmentIndex.GetCollectionID(),
 		PartitionID:  segmentIndex.GetPartitionID(),
 		SegmentID:    segmentIndex.GetSegmentID(),
-		FieldID:      field.GetFieldID(),
-		FieldName:    field.GetName(),
-		FieldType:    field.GetDataType().String(),
-		Nullable:     field.GetNullable(),
 		IndexID:      segmentIndex.GetIndexID(),
 		IndexType:    indexType,
 		BuildID:      segmentIndex.GetBuildID(),
@@ -423,6 +467,20 @@ func inspectVectorIndexValidity(ctx context.Context, resolvedStore *oss.Resolved
 		SegmentRows:  segmentIndex.GetNumRows(),
 		Status:       "ERROR",
 	}
+	if fieldIndex != nil {
+		record.FieldID = fieldIndex.GetFieldID()
+	}
+	if field != nil {
+		record.FieldID = field.GetFieldID()
+		record.FieldName = field.GetName()
+		record.FieldType = field.GetDataType().String()
+		record.Nullable = field.GetNullable()
+	}
+	return record
+}
+
+func inspectVectorIndexValidity(ctx context.Context, resolvedStore *oss.ResolvedObjectStore, segmentIndex *indexpb.SegmentIndex, fieldIndex *indexpb.IndexInfo, field *schemapb.FieldSchema) *VectorIndexValidityRecord {
+	record := newVectorIndexValidityRecord(segmentIndex, fieldIndex, field)
 	if segmentIndex.GetState() != commonpb.IndexState_Finished {
 		if segmentIndex.GetState() == commonpb.IndexState_Failed {
 			record.Status = "INDEX_FAILED"

@@ -276,12 +276,12 @@ func (s *InstanceState) scanExternalVectorNullSegments(ctx context.Context, coll
 	var externalRootPath string
 	var location externalSourceLocation
 	if format == "parquet" {
-		externalClient, bucketName, rootPath, resolvedLocation, err := newExternalMinioClient(
+		store, _, rootPath, resolvedLocation, err := newExternalObjectStore(
 			ctx, schema.GetExternalSource(), spec, p.SkipBucketCheck)
 		if err != nil {
 			return nil, err
 		}
-		externalStore = oss.NewMinioObjectStoreWithBucket(externalClient, bucketName)
+		externalStore = store
 		externalRootPath = rootPath
 		location = resolvedLocation
 	} else {

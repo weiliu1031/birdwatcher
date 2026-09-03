@@ -40,6 +40,12 @@ type MinioClientParam struct {
 	LoadFrequency      int
 	AliyunRoleAuthMode string
 
+	AzureClientID                string
+	AzureTenantID                string
+	AzureCredentialEndpoint      string
+	AzureRequestTimeoutMs        int64
+	DisableAzureConnectionString bool
+
 	BucketName string
 	RootPath   string
 
@@ -219,8 +225,7 @@ func NewMinioClient(ctx context.Context, p MinioClientParam) (*MinioClient, erro
 	case CloudProviderHuawei:
 		err = processMinioHuaweiOptions(p, opts)
 	case CloudProviderAzure:
-		// TODO support azure
-		fallthrough
+		return nil, errors.New("azure storage requires the ObjectStore API")
 	default:
 		return nil, errors.Newf("Cloud provider %s not supported yet", p.CloudProvider)
 	}

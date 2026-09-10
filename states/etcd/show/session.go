@@ -1,0 +1,133 @@
+package show
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/cockroachdb/errors"
+	"github.com/fatih/color"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/samber/lo"
+
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/states/etcd/common"
+)
+
+type SessionParam struct {
+	framework.DataSetParam `use:"show session" desc:"list online milvus components" alias:"sessions"`
+}
+
+// SessionCommand returns show session command.
+// usage: show session
+func (c *ComponentShow) SessionCommand(ctx context.Context, p *SessionParam) (*framework.PresetResultSet, error) {
+	sessions, err := common.ListSessions(ctx, c.client, c.metaPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list sessions")
+	}
+
+	return framework.NewPresetResultSet(framework.NewListResult[Sessions](sessions), framework.NameFormat(p.Format)), nil
+}
+
+type Sessions struct {
+	framework.ListResultSet[*models.Session]
+}
+
+func (rs *Sessions) TableHeaders() table.Row {
+	return table.Row{"ServerID", "ServerName", "Address", "HostName", "Version", "LeaseID"}
+}
+
+func (rs *Sessions) TableRows() []table.Row {
+	rows := make([]table.Row, 0, len(rs.Data))
+	for _, s := range rs.Data {
+		rows = append(rows, table.Row{s.ServerID, s.ServerName, s.Address, s.HostName, s.Version, s.LeaseID})
+	}
+	return rows
+}
+
+func (rs *Sessions) PrintAs(format framework.Format) string {
+	switch format {
+	case framework.FormatDefault, framework.FormatPlain:
+		return rs.printAsGroups()
+	case framework.FormatJSON:
+		return rs.PrintAsJSON()
+	default:
+	}
+	return ""
+}
+
+func (rs *Sessions) PrintAsJSON() string {
+	bs, err := json.Marshal(rs.Data)
+	if err != nil {
+		return err.Error()
+	}
+	return string(bs)
+}
+
+func (rs *Sessions) printAsGroups() string {
+	sb := &strings.Builder{}
+
+	sessionGroups := lo.GroupBy(rs.Data, func(session *models.Session) int64 {
+		return session.ServerID
+	})
+
+	componentGroups := lo.GroupBy(rs.Data, func(session *models.Session) string {
+		return session.ServerName
+	})
+
+	isMixture := func(session *models.Session) string {
+		sessions := sessionGroups[session.ServerID]
+		if len(sessions) > 1 {
+			return color.BlueString("[Mixture]")
+		}
+		return ""
+	}
+
+	coords := []string{"rootcoord", "datacoord", "querycoord", "indexcoord"}
+	if _, ok := componentGroups["mixcoord"]; ok {
+		// after 2.6, all coordinators are merged into one mixcoord session
+		coords = []string{"mixcoord"}
+	}
+
+	for _, coord := range coords {
+		fmt.Fprintf(sb, "Cordinator %s\n", color.GreenString(coord))
+		sessions := componentGroups[coord]
+		main := lo.FindOrElse(sessions, nil, func(session *models.Session) bool {
+			return session.IsMain(coord)
+		})
+		if main != nil {
+			fmt.Fprintf(sb, "%s\tID: %d%s\tVersion: %s\tAddress: %s\tHostName: %s\tLeaseID: %d%s\n", color.GreenString("[Main]"), main.ServerID, isMixture(main), main.Version, main.Address, main.HostName, main.LeaseID, formatServerLabels(main.ServerLabels))
+		}
+		standBys := lo.Filter(sessions, func(session *models.Session, _ int) bool {
+			return main == nil || session.ServerID != main.ServerID
+		})
+		for _, standBy := range standBys {
+			fmt.Fprintf(sb, "%s\tID: %d%s\tVersion: %s\tAddress: %s\tHostName: %s\tLeaseID: %d%s\n", color.YellowString("[Stand]"), standBy.ServerID, isMixture(standBy), standBy.Version, standBy.Address, standBy.HostName, standBy.LeaseID, formatServerLabels(standBy.ServerLabels))
+		}
+		fmt.Fprintln(sb)
+	}
+
+	for _, node := range []string{"datanode", "querynode", "indexnode", "proxy", "streamingnode"} {
+		fmt.Fprintf(sb, "Node(s) %s\n", color.GreenString(node))
+		sessions := componentGroups[node]
+		for _, session := range sessions {
+			fmt.Fprintf(sb, "\tID: %d\tVersion: %s\tAddress: %s\tHostName: %s\tLeaseID: %d%s\n", session.ServerID, session.Version, session.Address, session.HostName, session.LeaseID, formatServerLabels(session.ServerLabels))
+		}
+		fmt.Fprintln(sb)
+	}
+
+	return sb.String()
+}
+
+func formatServerLabels(labels map[string]string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(labels))
+	for k, v := range labels {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return fmt.Sprintf("\tLabels: [%s]", strings.Join(parts, ", "))
+}

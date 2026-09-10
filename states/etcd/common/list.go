@@ -1,0 +1,212 @@
+package common
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/samber/lo"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
+
+	"github.com/milvus-io/birdwatcher/states/kv"
+)
+
+func ListJSONObjects[T any, P interface{ *T }](ctx context.Context, kv kv.MetaKV, prefix string, filters ...func(t P) bool) ([]P, []string, error) {
+	keys, vals, err := kv.LoadWithPrefix(ctx, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keys) != len(vals) {
+		return nil, nil, fmt.Errorf("error: keys and vals of different size in ListJSONObjects:%d vs %d", len(keys), len(vals))
+	}
+	result := make([]P, 0, len(vals))
+LOOP:
+	for _, val := range vals {
+		var elem T
+		err = json.Unmarshal([]byte(val), &elem)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+
+		for _, filter := range filters {
+			if !filter(&elem) {
+				continue LOOP
+			}
+		}
+		result = append(result, &elem)
+	}
+	return result, keys, nil
+}
+
+// ListProtoObjects returns proto objects with specified prefix.
+func ListProtoObjects[T any, P interface {
+	*T
+	proto.Message
+}](ctx context.Context, kv kv.MetaKV, prefix string, filters ...func(t *T) bool) ([]*T, []string, error) {
+	keys, vals, err := kv.LoadWithPrefix(ctx, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keys) != len(vals) {
+		return nil, nil, fmt.Errorf("error: keys and vals of different size in ListProtoObjects:%d vs %d", len(keys), len(vals))
+	}
+	result := make([]*T, 0, len(keys))
+LOOP:
+	for idx, val := range vals {
+		var elem T
+		info := P(&elem)
+		err = proto.Unmarshal([]byte(val), info)
+		if err != nil {
+			if bytes.Equal([]byte(val), []byte{0xE2, 0x9B, 0xBC}) {
+				fmt.Printf("Tombstone found, key: %s\n", keys[idx])
+				continue
+			}
+			fmt.Printf("failed to unmarshal key=%s, err: %s\n", keys[idx], err.Error())
+			continue
+		}
+
+		for _, filter := range filters {
+			if !filter(&elem) {
+				continue LOOP
+			}
+		}
+		result = append(result, &elem)
+	}
+	return result, keys, nil
+}
+
+// ListProtoObjectsAdv returns proto objects with specified prefix.
+// add preFilter to handle tombstone cases.
+func ListProtoObjectsAdv[T any, P interface {
+	*T
+	proto.Message
+}](ctx context.Context, kv kv.MetaKV, prefix string, preFilter func(string, []byte) bool, filters ...func(t *T) bool) ([]*T, []string, error) {
+	keys, vals, err := kv.LoadWithPrefix(ctx, prefix)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keys) != len(vals) {
+		return nil, nil, fmt.Errorf("error: keys and vals of different size in ListProtoObjectsAdv:%d vs %d", len(keys), len(vals))
+	}
+	result := make([]*T, 0, len(vals))
+LOOP:
+	for i, val := range vals {
+		if !preFilter(keys[i], []byte(val)) {
+			continue
+		}
+		var elem T
+		info := P(&elem)
+		err = proto.Unmarshal([]byte(val), info)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+
+		for _, filter := range filters {
+			if !filter(&elem) {
+				continue LOOP
+			}
+		}
+		result = append(result, &elem)
+	}
+	return result, keys, nil
+}
+
+type ModelFilter[M any] interface {
+	Match(*M) bool
+}
+
+type PostFilter[M any] func(*M) bool
+
+func (f PostFilter[M]) Match(model *M) bool {
+	return f == nil || f(model)
+}
+
+func wrapPostFilters[M any](filters []func(*M) bool) []PostFilter[M] {
+	postFilters := make([]PostFilter[M], 0, len(filters))
+	for _, filter := range filters {
+		postFilters = append(postFilters, PostFilter[M](filter))
+	}
+	return postFilters
+}
+
+func ListObj2Models[T any, proto interface {
+	*T
+	protoreflect.ProtoMessage
+}, M any](ctx context.Context, cli kv.MetaKV, prefix string, convert func(proto, string) *M, filters ...func(*M) bool) ([]*M, error) {
+	infos, keys, err := ListProtoObjects[T, proto](ctx, cli, prefix)
+	if err != nil {
+		return nil, err
+	}
+	return lo.FilterMap(infos, func(info *T, idx int) (*M, bool) {
+		result := convert(info, keys[idx])
+		for _, filter := range filters {
+			if !filter(result) {
+				return nil, false
+			}
+		}
+		return result, true
+	}), nil
+}
+
+func ListObj2ModelsBySpec[T any, P interface {
+	*T
+	protoreflect.ProtoMessage
+}, M any](ctx context.Context, cli kv.MetaKV, basePath string, spec MetaKeySpec, hints MetaKeyHints, convert func(P, string) *M, filters ...ModelFilter[M]) ([]*M, error) {
+	return ListObj2ModelsByTarget(ctx, cli, spec.BuildScanTarget(basePath, hints), convert, filters...)
+}
+
+func ListObj2ModelsByTarget[T any, P interface {
+	*T
+	protoreflect.ProtoMessage
+}, M any](ctx context.Context, cli kv.MetaKV, target ScanTarget, convert func(P, string) *M, filters ...ModelFilter[M]) ([]*M, error) {
+	keys, vals, err := loadScanTarget(ctx, cli, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) != len(vals) {
+		return nil, fmt.Errorf("error: keys and vals of different size in ListObj2ModelsByTarget:%d vs %d", len(keys), len(vals))
+	}
+
+	result := make([]*M, 0, len(vals))
+LOOP:
+	for idx, val := range vals {
+		var elem T
+		info := P(&elem)
+		err = proto.Unmarshal([]byte(val), info)
+		if err != nil {
+			if bytes.Equal([]byte(val), []byte{0xE2, 0x9B, 0xBC}) {
+				fmt.Printf("Tombstone found, key: %s\n", keys[idx])
+				continue
+			}
+			fmt.Printf("failed to unmarshal key=%s, err: %s\n", keys[idx], err.Error())
+			continue
+		}
+
+		model := convert(info, keys[idx])
+		for _, filter := range filters {
+			if !filter.Match(model) {
+				continue LOOP
+			}
+		}
+		result = append(result, model)
+	}
+	return result, nil
+}
+
+func loadScanTarget(ctx context.Context, cli kv.MetaKV, target ScanTarget) ([]string, []string, error) {
+	if !target.Exact {
+		return cli.LoadWithPrefix(ctx, target.Key)
+	}
+	val, err := cli.Load(ctx, target.Key)
+	if err == kv.ErrKeyNotFound {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return []string{target.Key}, []string{val}, nil
+}

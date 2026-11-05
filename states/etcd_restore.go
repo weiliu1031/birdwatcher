@@ -2,77 +2,25 @@ package states
 
 import (
 	"bufio"
-	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"strconv"
 	"time"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/congqixia/birdwatcher/proto/v2.0/commonpb"
-	"github.com/golang/protobuf/proto"
 	"github.com/gosuri/uilive"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/states/kv"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 )
 
-// restoreEtcd write back backup file content to etcd
-// need backup first before calling this function
-// basePath is needed for key indication
-func restoreEtcd(cli *clientv3.Client, filePath string, basePath string) error {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	r, err := gzip.NewReader(f)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	lb := make([]byte, 8)
-	rd := bufio.NewReader(r)
-	lenRead, err := rd.Read(lb)
-	if err == io.EOF || lenRead < 8 {
-		fmt.Println("File does not contains valid header")
-	}
-
-	nextBytes := binary.LittleEndian.Uint64(lb)
-	headerBs := make([]byte, nextBytes)
-
-	lenRead, err = rd.Read(headerBs)
-	if err != nil {
-		fmt.Println("failed to read header", err.Error())
-		return nil
-	}
-
-	if lenRead != int(nextBytes) {
-		fmt.Println("not enough bytes for header")
-		return nil
-	}
-
-	header := &models.BackupHeader{}
-	err = proto.Unmarshal(headerBs, header)
-	if err != nil {
-		fmt.Println("cannot parse backup header", err.Error())
-		return err
-	}
-	fmt.Printf("header: %#v\n", header)
-
-	switch header.Version {
-	case 1:
-		return restoreFromV1File(cli, rd, header)
-	default:
-		fmt.Printf("backup version %d not supported\n", header.Version)
-		return fmt.Errorf("backup version %d not supported", header.Version)
-	}
-}
-
-func restoreFromV1File(cli *clientv3.Client, rd io.Reader, header *models.BackupHeader) error {
+func restoreFromV1File(cli kv.MetaKV, rd io.Reader, header *models.BackupHeader) error {
 	var nextBytes uint64
 	var bs []byte
 
@@ -86,8 +34,7 @@ func restoreFromV1File(cli *clientv3.Client, rd io.Reader, header *models.Backup
 	defer progressDisplay.Stop()
 
 	for {
-
-		bsRead, err := io.ReadFull(rd, lb) //rd.Read(lb)
+		bsRead, err := io.ReadFull(rd, lb) // rd.Read(lb)
 		// all file read
 		if err == io.EOF {
 			return nil
@@ -118,14 +65,14 @@ func restoreFromV1File(cli *clientv3.Client, rd io.Reader, header *models.Backup
 		entry := &commonpb.KeyDataPair{}
 		err = proto.Unmarshal(bs, entry)
 		if err != nil {
-			//Skip for now
+			// Skip for now
 			fmt.Printf("fail to parse line: %s, skip for now\n", err.Error())
 			continue
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 		defer cancel()
-		_, err = cli.Put(ctx, entry.Key, string(entry.Data))
+		err = cli.Save(ctx, entry.Key, string(entry.Data))
 		if err != nil {
 			fmt.Println("failed save kv into etcd, ", err.Error())
 			return err
@@ -134,6 +81,299 @@ func restoreFromV1File(cli *clientv3.Client, rd io.Reader, header *models.Backup
 		progress := i * 100 / int(header.Entries)
 
 		fmt.Fprintf(progressDisplay, progressFmt, progress, i, header.Entries)
+	}
+}
 
+func restoreV2File(rd *bufio.Reader, state *embedEtcdMockState) error {
+	var err error
+	for {
+		var ph models.PartHeader
+		err = readFixLengthHeader(rd, &ph)
+		if err != nil {
+			// TODO check EOF
+			return nil
+		}
+
+		switch ph.PartType {
+		case models.PartType_EtcdBackup:
+			instance, err := restoreEtcdFromBackV2(state.client, rd, &ph)
+			if err != nil {
+				fmt.Println("failed to restore etcd from backup file", err.Error())
+				return err
+			}
+			state.SetInstance(instance)
+		case models.PartType_MetricsBackup:
+			restoreMetrics(rd, &ph, func(session *models.Session, metrics, defaultMetrics []byte) {
+				state.metrics[fmt.Sprintf("%s-%d", session.ServerName, session.ServerID)] = metrics
+				state.defaultMetrics[fmt.Sprintf("%s-%d", session.ServerName, session.ServerID)] = defaultMetrics
+			})
+		case models.PartType_Configurations:
+			// testRestoreConfigurations(rd, ph)
+		case models.PartType_AppMetrics:
+			// testRestoreConfigurations(rd, ph)
+		}
+	}
+}
+
+func restoreEtcdFromBackV2(cli kv.MetaKV, rd io.Reader, ph *models.PartHeader) (string, error) {
+	meta := make(map[string]string)
+	err := json.Unmarshal(ph.Extra, &meta)
+	if err != nil {
+		return "", err
+	}
+
+	cnt, err := strconv.ParseInt(meta["cnt"], 10, 64)
+	if err != nil {
+		return "", err
+	}
+
+	var nextBytes uint64
+	var bs []byte
+
+	lb := make([]byte, 8)
+	i := 0
+	progressDisplay := uilive.New()
+	progressFmt := "Restoring backup ... %d%%(%d/%d)\n"
+
+	progressDisplay.Start()
+	fmt.Fprintf(progressDisplay, progressFmt, 0, 0, cnt)
+	defer progressDisplay.Stop()
+
+	batchNum := 10
+	ch := make(chan []*commonpb.KeyDataPair, 10)
+
+	g, gCtx := errgroup.WithContext(context.Background())
+
+	g.Go(func() error {
+		defer close(ch)
+		batch := make([]*commonpb.KeyDataPair, 0, batchNum)
+		// best-effort: hand off whatever was already read, even when the loop
+		// below returns early because of a read error or cancellation.
+		defer func() {
+			if len(batch) > 0 {
+				select {
+				case ch <- batch:
+				case <-gCtx.Done():
+				}
+			}
+		}()
+		var lastPrint time.Time
+		for {
+			select {
+			case <-gCtx.Done():
+				return gCtx.Err()
+			default:
+			}
+
+			bsRead, err := io.ReadFull(rd, lb) // rd.Read(lb)
+			// all file read
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				fmt.Println("failed to read file:", err.Error())
+				return err
+			}
+			if bsRead < 8 {
+				fmt.Printf("fail to read next length %d instead of 8 read\n", bsRead)
+				return errors.New("invalid file format")
+			}
+
+			nextBytes = binary.LittleEndian.Uint64(lb)
+			// stopper found
+			if nextBytes == 0 {
+				return nil
+			}
+			bs = make([]byte, nextBytes)
+
+			// cannot use rd.Read(bs), since proto marshal may generate a stopper
+			bsRead, err = io.ReadFull(rd, bs)
+			if err != nil {
+				fmt.Println("failed to read next kv data", err.Error())
+				return err
+			}
+			if uint64(bsRead) != nextBytes {
+				fmt.Printf("bytesRead(%d)is not equal to nextBytes(%d)\n", bsRead, nextBytes)
+				return errors.New("bad file format")
+			}
+
+			entry := &commonpb.KeyDataPair{}
+			err = proto.Unmarshal(bs, entry)
+			if err != nil {
+				// Skip for now
+				fmt.Printf("fail to parse line: %s, skip for now\n", err.Error())
+				continue
+			}
+
+			batch = append(batch, entry)
+			if len(batch) >= batchNum {
+				select {
+				case ch <- batch:
+					batch = make([]*commonpb.KeyDataPair, 0, batchNum)
+				case <-gCtx.Done():
+					return gCtx.Err()
+				}
+			}
+			i++
+			progress := 100
+			if cnt > 0 {
+				progress = i * 100 / int(cnt)
+			}
+
+			if time.Since(lastPrint) > time.Millisecond*10 || progress == 100 {
+				fmt.Fprintf(progressDisplay, progressFmt, progress, i, cnt)
+				lastPrint = time.Now()
+			}
+		}
+	})
+
+	workerNum := 3
+	for w := 0; w < workerNum; w++ {
+		g.Go(func() error {
+			// On abort, gCtx is canceled but ch isn't closed until the producer
+			// notices, so this loop may still drain a few more already-queued
+			// batches and call MultiSave with a canceled context; those calls
+			// fail fast and their errors are dropped, since errgroup only keeps
+			// the first error returned. Harmless, just wasted work.
+			for batch := range ch {
+				keys := make([]string, 0, len(batch))
+				values := make([]string, 0, len(batch))
+				for _, entry := range batch {
+					keys = append(keys, entry.Key)
+					values = append(values, string(entry.Data))
+				}
+
+				saveCtx, cancel := context.WithTimeout(gCtx, time.Second*3)
+				err := cli.MultiSave(saveCtx, keys, values)
+				cancel()
+				if err != nil {
+					return fmt.Errorf("save batch: %w", err)
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return "", err
+	}
+
+	return meta["instance"], nil
+}
+
+func restoreMetrics(rd io.Reader, ph *models.PartHeader, handler func(session *models.Session, metrics, defaultMetrics []byte)) error {
+	for {
+		bs, nb, err := readBackupBytes(rd)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		// stopper
+		if nb == 0 {
+			return nil
+		}
+
+		// session
+		session := &models.Session{}
+		err = json.Unmarshal(bs, session)
+		if err != nil {
+			return err
+		}
+
+		mbs, _, err := readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+
+		dmbs, _, err := readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+		handler(session, mbs, dmbs)
+	}
+}
+
+func testRestoreMetrics(rd io.Reader, ph *models.PartHeader) error {
+	for {
+		bs, nb, err := readBackupBytes(rd)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		// stopper
+		if nb == 0 {
+			return nil
+		}
+
+		// session
+		fmt.Println(string(bs))
+
+		bs, _, err = readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("metrics len:", len(bs))
+		bs, _, err = readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+		fmt.Println("default metrics len:", len(bs))
+	}
+}
+
+func testRestoreConfigurations(rd io.Reader, ph *models.PartHeader) error {
+	for {
+		bs, nb, err := readBackupBytes(rd)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		// stopper
+		if nb == 0 {
+			return nil
+		}
+
+		// session
+		fmt.Println(string(bs))
+
+		bs, _, err = readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("configuration len:", len(bs))
+	}
+}
+
+func testRestoreAppMetrics(rd io.Reader, ph *models.PartHeader) error {
+	for {
+		bs, nb, err := readBackupBytes(rd)
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		// stopper
+		if nb == 0 {
+			return nil
+		}
+
+		// session
+		fmt.Println(string(bs))
+
+		bs, _, err = readBackupBytes(rd)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("app metrics len:", len(bs))
 	}
 }

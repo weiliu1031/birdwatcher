@@ -1,63 +1,140 @@
+version: "2"
 run:
-  skip-dirs:
-    - bin
-    - configs
-    - deployments
-    - docs
-    - scripts
-    - internal/core
-
+  go: 1.25.9
+  build-tags:
+    - WKAFKA
+output:
+  formats:
+    text:
+      path: stdout
 linters:
-  disable-all: true
+  default: none
   enable:
-    - typecheck
-    - goimports
-    - misspell
+    - decorder
+    - durationcheck
+    - gocritic
+    - gosec
     - govet
     - ineffassign
-    - gosimple
-    - gosec
+    - misspell
     - revive
-
-linters-settings:
-  misspell:
-    locale: US
-  gocritic:
-    enabled-checks:
-      - ruleguard
-    settings:
-      ruleguard:
-        failOnError: true
-        rules: "rules.go"
-
+    - staticcheck
+    - unconvert
+    - whitespace
+  settings:
+    gocritic:
+      enabled-checks:
+        - ruleguard
+      settings:
+        ruleguard:
+          failOn: all
+          rules: rules.go
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+        - name: var-naming
+          arguments:
+            - - ID
+          severity: warning
+          disabled: false
+        - name: context-as-argument
+          arguments:
+            - allowTypesBefore: '*testing.T'
+          severity: warning
+          disabled: false
+        - name: datarace
+          severity: warning
+          disabled: false
+        - name: duplicated-imports
+          severity: warning
+          disabled: false
+        - name: waitgroup-by-value
+          severity: warning
+          disabled: false
+        - name: indent-error-flow
+          arguments:
+            - preserveScope
+          severity: warning
+          disabled: false
+        - name: range-val-in-closure
+          severity: warning
+          disabled: false
+        - name: range-val-address
+          severity: warning
+          disabled: false
+        - name: string-of-int
+          severity: warning
+          disabled: false
+  exclusions:
+    generated: lax
+    rules:
+      - path: (.+)\.go$
+        text: should have a package comment
+      - path: (.+)\.go$
+        text: should have comment
+      - path: (.+)\.go$
+        text: should be of the form
+      - path: (.+)\.go$
+        text: should not use dot imports
+      - path: (.+)\.go$
+        text: which can be annoying to use
+      - path: (.+)\.go$
+        text: G102
+      - path: (.+)\.go$
+        text: G103
+      - path: (.+)\.go$
+        text: G104
+      - path: (.+)\.go$
+        text: G115
+      - path: (.+)\.go$
+        text: G301
+      - path: (.+)\.go$
+        text: G302
+      - path: (.+)\.go$
+        text: G304
+      - path: (.+)\.go$
+        text: G307
+      - path: (.+)\.go$
+        text: G402
+      - path: (.+)\.go$
+        text: G404
+      - path: (.+)\.go$
+        text: SA1019
+      - path: (.+)\.go$
+        text: SA5001
+    paths:
+      - configs
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-use-default: false
-  exclude:
-    - should have a package comment
-    - should have comment
-    - should be of the form
-    - should not use dot imports
-    - which can be annoying to use
-    # Binds to all network interfaces
-    - G102
-    # Errors unhandled
-    - G104
-    # file/folder Permission
-    - G301
-    - G302
-    # Potential file inclusion via variable
-    - G304
-    # Deferring unsafe method like *os.File Close 
-    - G307
-    # Use of weak random number generator math/rand
-    - G404
-    # Exclude copylocks
-    - copylocks
-  # Maximum issues count per one linter. Set to 0 to disable. Default is 50.
   max-issues-per-linter: 0
-  # Maximum count of issues with the same text. Set to 0 to disable. Default is 3.
   max-same-issues: 0
-
-service:
-  golangci-lint-version: 1.27.0 # use the fixed version to not introduce new linters unexpectedly
-
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/milvus-io)
+      custom-order: true
+    gofumpt:
+      module-path: github.com/milvus-io
+    goimports:
+      local-prefixes:
+        - github.com/milvus-io
+  exclusions:
+    generated: lax
+    paths:
+      - configs
+      - third_party$
+      - builtin$
+      - examples$

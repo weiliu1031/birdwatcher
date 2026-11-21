@@ -9,58 +9,49 @@ import (
 	"strings"
 	"time"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/spf13/cobra"
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/milvus-io/birdwatcher/framework"
+	"github.com/milvus-io/birdwatcher/models"
+	"github.com/milvus-io/birdwatcher/states/kv"
 )
 
-// getEtcdKillCmd returns command for kill component session
-// usage: kill component
-func getEtcdKillCmd(cli *clientv3.Client, basePath string) *cobra.Command {
-
-	component := compAll
-	cmd := &cobra.Command{
-		Use:   "kill",
-		Short: "Kill component session from etcd",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			id, err := cmd.Flags().GetInt64("id")
-			if err != nil {
-				return err
-			}
-			switch component {
-			case compQueryCoord, compDataCoord, compIndexCoord, compRootCoord:
-				return etcdKillComponent(cli, path.Join(basePath, "session", strings.ToLower(string(component))), id)
-			case compQueryNode:
-				return etcdKillComponent(cli, path.Join(basePath, "session", fmt.Sprintf("%s-%d", strings.ToLower(string(component)), id)), id)
-			case compAll:
-				fallthrough
-			default:
-				return errors.New("need to specify component type for killing")
-			}
-		},
-	}
-
-	cmd.Flags().Var(&component, "component", "component type to kill")
-	cmd.Flags().Int64("id", 0, "Server ID to kill")
-	return cmd
+type EtcdKillParam struct {
+	framework.ExecutionParam `use:"kill" desc:"Kill component session from etcd"`
+	Component                string `name:"component" default:"" desc:"component type to kill"`
+	NodeID                   int64  `name:"id" default:"0" desc:"Server ID to kill"`
 }
 
-func etcdKillComponent(cli *clientv3.Client, key string, id int64) error {
+func (s *InstanceState) KillCommand(ctx context.Context, p *EtcdKillParam) error {
+	var key string
+	switch milvusComponent(strings.ToUpper(p.Component)) {
+	case compQueryCoord, compDataCoord, compIndexCoord, compRootCoord, compMixCoord:
+		key = path.Join(s.basePath, "session", strings.ToLower(p.Component))
+	case compQueryNode, compDataNode, compProxy:
+		key = path.Join(s.basePath, "session", fmt.Sprintf("%s-%d", strings.ToLower(p.Component), p.NodeID))
+	case compAll:
+		fallthrough
+	default:
+		return errors.New("need to specify component type for killing")
+	}
+
+	if p.Run {
+		return etcdKillComponent(s.client, key, p.NodeID)
+	}
+	fmt.Println("Plan to remove session key: ", key)
+
+	return nil
+}
+
+func etcdKillComponent(cli kv.MetaKV, key string, id int64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel()
-	resp, err := cli.Get(ctx, key)
-
+	val, err := cli.Load(ctx, key)
 	if err != nil {
 		return err
 	}
 
-	if len(resp.Kvs) != 1 {
-		return errors.New("cannot find session")
-	}
-
 	session := &models.Session{}
 
-	err = json.Unmarshal(resp.Kvs[0].Value, session)
+	err = json.Unmarshal([]byte(val), session)
 	if err != nil {
 		return fmt.Errorf("faild to parse session for key %s, error: %w", key, err)
 	}
@@ -71,6 +62,5 @@ func etcdKillComponent(cli *clientv3.Client, key string, id int64) error {
 
 	// remove session
 
-	_, err = cli.Delete(context.Background(), key)
-	return err
+	return cli.Remove(context.Background(), key)
 }

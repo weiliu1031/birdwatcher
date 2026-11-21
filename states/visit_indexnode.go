@@ -1,63 +1,57 @@
 package states
 
-import (
-	"context"
-	"fmt"
+// import (
+// 	"fmt"
 
-	"github.com/congqixia/birdwatcher/models"
-	"github.com/congqixia/birdwatcher/proto/v2.0/commonpb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/indexpb"
-	"github.com/congqixia/birdwatcher/proto/v2.0/milvuspb"
-	"github.com/spf13/cobra"
-	"google.golang.org/grpc"
-)
+// 	"github.com/spf13/cobra"
+// 	"google.golang.org/grpc"
 
-type indexNodeState struct {
-	cmdState
-	client    indexpb.IndexNodeClient
-	conn      *grpc.ClientConn
-	prevState State
-}
+// 	"github.com/milvus-io/birdwatcher/framework"
+// 	"github.com/milvus-io/birdwatcher/models"
+// 	"github.com/milvus-io/birdwatcher/proto/v2.0/indexpb"
+// 	indexpbv2 "github.com/milvus-io/birdwatcher/proto/v2.2/indexpb"
+// )
 
-func getIndexNodeState(client indexpb.IndexNodeClient, conn *grpc.ClientConn, prev State, session *models.Session) State {
-	cmd := &cobra.Command{}
+// type indexNodeState struct {
+// 	*framework.CmdState
+// 	session   *models.Session
+// 	client    indexpb.IndexNodeClient
+// 	clientv2  indexpbv2.IndexNodeClient
+// 	conn      *grpc.ClientConn
+// 	prevState framework.State
+// }
 
-	state := &indexNodeState{
-		cmdState: cmdState{
-			label:   fmt.Sprintf("IndexNode-%d(%s)", session.ServerID, session.Address),
-			rootCmd: cmd,
-		},
-		client: client,
-		conn:   conn,
-	}
+// // SetupCommands setups the command.
+// // also called after each command run to reset flag values.
+// func (s *indexNodeState) SetupCommands() {
+// 	cmd := &cobra.Command{}
+// 	cmd.AddCommand(
+// 		// metrics
+// 		getMetricsCmd(s.client),
+// 		// configuration
+// 		getConfigurationCmd(s.clientv2, s.session.ServerID),
+// 		// back
+// 		getBackCmd(s, s.prevState),
+// 		// exit
+// 		getExitCmd(s),
+// 	)
+// 	s.MergeFunctionCommands(cmd, s)
 
-	cmd.AddCommand(
-		//GetMetrics
-		getIndexNodeMetrics(client),
-		//back
-		getBackCmd(state, prev),
-		// exit
-		getExitCmd(state),
-	)
-	return state
-}
+// 	s.CmdState.RootCmd = cmd
+// 	s.SetupFn = s.SetupCommands
+// }
 
-func getIndexNodeMetrics(client indexpb.IndexNodeClient) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "GetMetrics",
-		Short: "show the metrics provided by this indexnode",
-		Run: func(cmd *cobra.Command, args []string) {
+// func getIndexNodeState(client indexpb.IndexNodeClient, conn *grpc.ClientConn, prev framework.State, session *models.Session) framework.State {
+// 	state := &indexNodeState{
+// 		CmdState:  framework.NewCmdState(fmt.Sprintf("IndexNode-%d(%s)", session.ServerID, session.Address)),
+// 		session:   session,
+// 		client:    client,
+// 		clientv2:  indexpbv2.NewIndexNodeClient(conn),
+// 		conn:      conn,
+// 		prevState: prev,
+// 	}
 
-			resp, err := client.GetMetrics(context.Background(), &milvuspb.GetMetricsRequest{
-				Base:    &commonpb.MsgBase{},
-				Request: `{"metric_type": "system_info"}`,
-			})
-			if err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			fmt.Printf("Metrics: %#v\n", resp.Response)
-		},
-	}
-	return cmd
-}
+// 	state.SetupCommands()
+
+// 	return state
+// }
